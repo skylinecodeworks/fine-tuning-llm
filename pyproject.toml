@@ -1,0 +1,11 @@
+[project]
+name = "fine-tuning-llm"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "datasets>=3.5.0",
+    "pandas>=2.2.3",
+    "transformers>=4.51.3",
+]
