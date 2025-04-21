@@ -25,22 +25,45 @@ def get_device():
 
 # --- FUNCIÓN DE TOKENIZACIÓN AJUSTADA ---
 
-def tokenize_function(examples, tokenizer):
-    """
-    Combina prompt y response, añade EOS, y prepara labels para causal LM.
-    """
-    texts = [
-        f"Q:{p}{tokenizer.eos_token}A:{r}{tokenizer.eos_token}"
-        for p, r in zip(examples["prompt"], examples["response"])
-    ]
-    model_inputs = tokenizer(
-        texts,
+def tokenize_function(example, tokenizer, max_length=512):
+    # tokenizamos prompt y response por separado (devuelven listas de ints)
+    p_ids = tokenizer(
+        example["prompt"],
         truncation=True,
-        padding="longest",
-        max_length=512,
-    )
-    model_inputs["labels"] = model_inputs["input_ids"].copy()
-    return model_inputs
+        padding=False,
+        add_special_tokens=False
+    )["input_ids"]
+    r_ids = tokenizer(
+        example["response"],
+        truncation=True,
+        padding=False,
+        add_special_tokens=False
+    )["input_ids"]
+
+    # construimos secuencia [prompt..., EOS, response..., EOS]
+    ids = p_ids + [tokenizer.eos_token_id] + r_ids + [tokenizer.eos_token_id]
+    # generamos labels enmascarando el prompt
+    labels = [-100] * (len(p_ids) + 1) + r_ids + [tokenizer.eos_token_id]
+
+    # recortamos si excede max_length
+    if len(ids) > max_length:
+        ids = ids[:max_length]
+        labels = labels[:max_length]
+
+    # máscara de atención y padding
+    attention_mask = [1] * len(ids)
+    pad_len = max_length - len(ids)
+    ids += [tokenizer.pad_token_id] * pad_len
+    labels += [-100] * pad_len
+    attention_mask += [0] * pad_len
+
+    return {
+        "input_ids": ids,
+        "attention_mask": attention_mask,
+        "labels": labels,
+    }
+
+
 
 
 def load_data_from_mongodb():
@@ -83,17 +106,21 @@ def split_train_eval(df, train_ratio=0.8):
 
 def process_data_batch(tokenizer):
     df = load_data_from_mongodb()
+    print("Longitudes de prompt (DATA):", df["prompt"].str.len().describe())
+    print("Longitudes de response (DATA):", df["response"].str.len().describe())
     train_df, _ = split_train_eval(df, train_ratio=0.8)
     dataset = Dataset.from_pandas(train_df)
-    tokenized_dataset = dataset.map(lambda ex: tokenize_function(ex, tokenizer), batched=True)
+    tokenized_dataset = dataset.map(lambda ex: tokenize_function(ex, tokenizer), batched=False)
     return tokenized_dataset
 
 
 def process_eval_batch(tokenizer):
     df = load_data_from_mongodb()
+    print("Longitudes de prompt (EVAL):", df["prompt"].str.len().describe())
+    print("Longitudes de response (EVAL):", df["response"].str.len().describe())
     _, eval_df = split_train_eval(df, train_ratio=0.8)
     dataset = Dataset.from_pandas(eval_df)
-    tokenized_dataset = dataset.map(lambda ex: tokenize_function(ex, tokenizer), batched=True)
+    tokenized_dataset = dataset.map(lambda ex: tokenize_function(ex, tokenizer), batched=False)
     return tokenized_dataset
 
 
@@ -122,11 +149,11 @@ def main():
 
     peft_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
-        r=8,
-        lora_alpha=8,
-        lora_dropout=0.0,
+        r=4,  # prueba r más bajo
+        lora_alpha=16,  # escala un poco más agresiva
+        lora_dropout=0.1,  # ayuda a regularizar
         bias="none",
-        target_modules=["q_proj", "v_proj"],
+        target_modules=["q_proj", "v_proj"],  # revisa que coincidan con tu modelo
     )
     model = get_peft_model(model, peft_config)
     model.print_trainable_parameters()
@@ -134,23 +161,22 @@ def main():
 
     training_args = TrainingArguments(
         seed=42,
+        learning_rate=5e-6,
+        num_train_epochs=4,
+        warmup_ratio=0.1,
+        per_device_train_batch_size=4,
+        gradient_accumulation_steps=16,
+        weight_decay=0.0,
         output_dir=output_dir,
         eval_strategy=EvaluationStrategy.EPOCH,
         logging_dir="./logs",
-        num_train_epochs=2,
-        per_device_train_batch_size=4,
-        per_device_eval_batch_size=4,
         warmup_steps=200,
-        learning_rate=0.0001,
-        weight_decay=0.01,
         max_grad_norm=0.1,
         logging_steps=50,
         save_strategy="epoch",
         load_best_model_at_end=True,
-        gradient_accumulation_steps=32,
         #per_gpu_train_batch_size=128,
         lr_scheduler_type="cosine",
-        warmup_ratio=0.02,
         fp16=False,
         bf16=False,
     )
@@ -185,9 +211,11 @@ def main():
     output_ids = model.generate(
         inputs["input_ids"],
         attention_mask=inputs["attention_mask"],
-        max_new_tokens=50,
-        num_beams=4,
-        temperature=0.7,
+        max_new_tokens=30,
+        num_beams=5,
+        temperature=0.2,
+        top_p=0.9,
+        top_k=50,
         early_stopping=True,
     )
     generated_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
