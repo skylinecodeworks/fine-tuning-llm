@@ -5,6 +5,9 @@ build/
 dist/
 mistral_finetuned/
 wheels/
+finetuned/
+cache_tok_eval/
+cache_tok_train/
 *.egg-info
 
 # Virtual environments
