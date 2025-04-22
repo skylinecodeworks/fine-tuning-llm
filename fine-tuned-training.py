@@ -105,23 +105,58 @@ def split_train_eval(df, train_ratio=0.8):
 
 
 def process_data_batch(tokenizer):
+    # 1. Carga y chequeos básicos
     df = load_data_from_mongodb()
     print("Longitudes de prompt (DATA):", df["prompt"].str.len().describe())
     print("Longitudes de response (DATA):", df["response"].str.len().describe())
+
+    # 2. Split train/eval
     train_df, _ = split_train_eval(df, train_ratio=0.8)
+
+    # 3. Cache path
+    cache_path = "./cache_tok_train"
+    if os.path.isdir(cache_path):
+        # Carga ya tokenizado
+        return Dataset.load_from_disk(cache_path)
+
+    # 4. Tokenización ejemplo a ejemplo (batched=False para mantener tipos homogéneos)
     dataset = Dataset.from_pandas(train_df)
-    tokenized_dataset = dataset.map(lambda ex: tokenize_function(ex, tokenizer), batched=False)
-    return tokenized_dataset
+    tokenized = dataset.map(
+        lambda ex: tokenize_function(ex, tokenizer),
+        batched=False,
+        remove_columns=dataset.column_names
+    )
+
+    # 5. Guarda el cache
+    tokenized.save_to_disk(cache_path)
+    return tokenized
 
 
 def process_eval_batch(tokenizer):
+    # 1. Carga y chequeos básicos
     df = load_data_from_mongodb()
     print("Longitudes de prompt (EVAL):", df["prompt"].str.len().describe())
     print("Longitudes de response (EVAL):", df["response"].str.len().describe())
+
+    # 2. Split train/eval
     _, eval_df = split_train_eval(df, train_ratio=0.8)
+
+    # 3. Cache path
+    cache_path = "./cache_tok_eval"
+    if os.path.isdir(cache_path):
+        return Dataset.load_from_disk(cache_path)
+
+    # 4. Tokenización elemento a elemento
     dataset = Dataset.from_pandas(eval_df)
-    tokenized_dataset = dataset.map(lambda ex: tokenize_function(ex, tokenizer), batched=False)
-    return tokenized_dataset
+    tokenized = dataset.map(
+        lambda ex: tokenize_function(ex, tokenizer),
+        batched=False,
+        remove_columns=dataset.column_names
+    )
+
+    # 5. Guarda el cache
+    tokenized.save_to_disk(cache_path)
+    return tokenized
 
 
 def main():
@@ -143,22 +178,28 @@ def main():
         config=model_config,
         trust_remote_code=True,
         low_cpu_mem_usage=True,
-        attn_implementation="eager",
-        use_flash_attention_2=False,
     )
 
+    # --- PEFT LoRA Setup ---
     peft_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
-        r=4,  # prueba r más bajo
-        lora_alpha=16,  # escala un poco más agresiva
-        lora_dropout=0.1,  # ayuda a regularizar
+        r=4,
+        lora_alpha=16,
+        lora_dropout=0.1,
         bias="none",
-        target_modules=["q_proj", "v_proj"],  # revisa que coincidan con tu modelo
+        # Incluimos todas las proyecciones de atención para habilitar gradientes
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
     )
     model = get_peft_model(model, peft_config)
+
+    # Verificar que hay parámetros entrenables
     model.print_trainable_parameters()
+    trainable_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total trainable parameters: {trainable_count}")
+
     model.to(device)
 
+    # --- Training Arguments ---
     training_args = TrainingArguments(
         seed=42,
         learning_rate=5e-6,
@@ -170,12 +211,10 @@ def main():
         output_dir=output_dir,
         eval_strategy=EvaluationStrategy.EPOCH,
         logging_dir="./logs",
-        warmup_steps=200,
-        max_grad_norm=0.1,
+        report_to=None,  # Desactivar TensorBoard o configurar tras instalar
         logging_steps=50,
         save_strategy="epoch",
         load_best_model_at_end=True,
-        #per_gpu_train_batch_size=128,
         lr_scheduler_type="cosine",
         fp16=False,
         bf16=False,
@@ -189,7 +228,6 @@ def main():
         mlm=False,
     )
 
-    # Usar Trainer estándar en lugar de StableTrainer
     trainer = Trainer(
         model=model,
         args=training_args,
@@ -205,12 +243,12 @@ def main():
     eval_metrics = trainer.evaluate()
     print(f"Eval loss: {eval_metrics['eval_loss']:.3f}")
 
+    # Prueba de generación
     input_text = "¿Qué vecinos tiene el nodo 21?"
-    inputs = tokenizer(input_text, return_tensors="pt", padding=True, truncation=True)
-    inputs = {k: v.to(device) for k, v in inputs.items()}
+    inputs = tokenizer(input_text, return_tensors="pt", padding=True, truncation=True).to(device)
     output_ids = model.generate(
-        inputs["input_ids"],
-        attention_mask=inputs["attention_mask"],
+        inputs.input_ids,
+        attention_mask=inputs.attention_mask,
         max_new_tokens=30,
         num_beams=5,
         temperature=0.2,
@@ -218,8 +256,7 @@ def main():
         top_k=50,
         early_stopping=True,
     )
-    generated_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-    print("Salida generada:", generated_text)
+    print("Salida generada:", tokenizer.decode(output_ids[0], skip_special_tokens=True))
 
 if __name__ == "__main__":
     main()
